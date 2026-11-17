@@ -188,7 +188,7 @@ struct SynTHBloKJam : Module {
         configInput(RUN_INPUT, "Run (trigger: toggles RUN, like pressing it)");
         configInput(DIR_INPUT, "Direction CV (0-2.5 V forward, 2.5-5 reverse, 5-7.5 ping-pong, 7.5-10 random)");
         for (int r = 0; r < 8; r++) configOutput(TRIG_OUTPUT + r, "Track " + std::to_string(r + 1) + " trigger");
-        for (int i = 0; i < 8; i++) { configOutput(STRIP_OUTPUT + i, "Strip " + std::to_string(i + 1)); sm[i] = 0.f; }
+        for (int i = 0; i < 8; i++) { configOutput(STRIP_OUTPUT + i, "Strip " + std::to_string(i + 1) + " CV (the slider below it, in the selected bank)"); sm[i] = 0.f; }
         configOutput(KNOB_OUTPUT, "JAM knob CV (0..10 V)");
         for (int p = 0; p < 8; p++) for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++) pat[p][r][c] = false;
         for (int b = 0; b < 8; b++) for (int i = 0; i < 8; i++) val[b][i] = 0.f;
@@ -688,6 +688,24 @@ struct JPatBtn : OpaqueWidget {
 struct JStrip : OpaqueWidget {
     SynTHBloKJam* module = NULL;
     int idx = 0;
+    // hover help (Nick: "how do users know that?"): which jack it feeds, the bank, the voltage now
+    ui::Tooltip* tip = NULL;
+    std::string tipText() {
+        bool bip = module && module->params[SynTHBloKJam::RANGE_PARAM].getValue() > 0.5f;
+        float v = get() * 10.f - (bip ? 5.f : 0.f);
+        return string::f("Strip %d, bank %c: %.2f V at the jack above it (%s). Banks A-H = 8 sets of values; the +/-5V key = the range",
+                         idx + 1, 'A' + (module ? module->bank() : 0), v, bip ? "-5..+5 V" : "0..10 V");
+    }
+    void onEnter(const EnterEvent& e) override {
+        if (!tip && settings::tooltips) { tip = new ui::Tooltip; tip->text = tipText(); APP->scene->addChild(tip); }
+        OpaqueWidget::onEnter(e);
+    }
+    void onLeave(const LeaveEvent& e) override {
+        if (tip) { APP->scene->removeChild(tip); delete tip; tip = NULL; }
+        OpaqueWidget::onLeave(e);
+    }
+    ~JStrip() { if (tip) { APP->scene->removeChild(tip); delete tip; } }
+    void step() override { if (tip) tip->text = tipText(); OpaqueWidget::step(); }
     JStrip() { box.size = mm2px(Vec(4.8f, 48.f)); }
     float get() { return module ? module->val[module->bank()][idx] : 0.25f + 0.08f * idx; }
     void set(float v) { if (module) module->val[module->bank()][idx] = clamp(v, 0.f, 1.f); }
@@ -1159,13 +1177,22 @@ struct JClockDisplay : OpaqueWidget {
             nvgTextAlign(args.vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
             nvgFontSize(args.vg, bigFont);
             nvgFillColor(args.vg, amb);
-            nvgText(args.vg, 5.f, H * 0.33f, bpm, NULL);
+            nvgText(args.vg, 5.f, H * 0.27f, bpm, NULL);
             nvgFontSize(args.vg, smallFont);
             nvgFillColor(args.vg, dim);
-            nvgText(args.vg, 5.f, H * 0.74f, info, NULL);
+            nvgText(args.vg, 5.f, H * 0.57f, info, NULL);
             nvgTextAlign(args.vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
             nvgFillColor(args.vg, run ? nvgRGBA(120, 230, 90, 255) : dim);
-            nvgText(args.vg, W - 5.f, H * 0.74f, run ? "RUN" : "STOP", NULL);
+            nvgText(args.vg, W - 5.f, H * 0.57f, run ? "RUN" : "STOP", NULL);
+            // what the sliders are (Nick: "how do users know that?"): CV out of the jacks above them, the bank, the range
+            int bk = module ? module->bank() : 0;
+            bool bip = module && module->params[SynTHBloKJam::RANGE_PARAM].getValue() > 0.5f;
+            char st[64]; snprintf(st, sizeof st, "STRIPS -> JACKS  |  BANK %c  |  %s", 'A' + bk, bip ? "+/-5 V" : "0-10 V");
+            nvgTextAlign(args.vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+            nvgFontSize(args.vg, 6.5f);
+            nvgTextLetterSpacing(args.vg, 0.3f);
+            nvgFillColor(args.vg, nvgRGBA(255, 190, 90, 170));
+            nvgText(args.vg, 5.f, H * 0.86f, st, NULL);
         }
     }
 };
