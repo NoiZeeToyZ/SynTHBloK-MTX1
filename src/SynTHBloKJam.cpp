@@ -1013,6 +1013,104 @@ struct M1Screen : TransparentWidget {
     }
 };
 
+// MTX-1 (Nov 16 2026, Nick: "should we have this on the MTX-1? ok add it"): MTX-8's length control, copied from
+// Matrix8_ui.hpp (that header's JAM CC names clash with this file's)
+// Arrow buttons step the length; the display shows the looped steps and the playhead.
+template <class M>
+struct M1LoopArrow : OpaqueWidget {
+    M* module = NULL;
+    int dir = 1;                  // +1 = UP (longer), -1 = DOWN (shorter)
+    int maxLen = 8;               // MTX QUAD: 16
+    float flash = 0.f;
+    void draw(const DrawArgs& args) override {
+        float W = box.size.x, H = box.size.y;
+        bool on = flash > 0.f;
+        nvgBeginPath(args.vg);
+        nvgRoundedRect(args.vg, 0.f, 0.f, W, H, 1.4f);
+        nvgFillColor(args.vg, on ? nvgRGBA(255, 112, 15, 235) : nvgRGBA(40, 25, 8, 255));
+        nvgFill(args.vg);
+        nvgStrokeColor(args.vg, nvgRGBA(255, 180, 90, on ? 255 : 120));
+        nvgStrokeWidth(args.vg, on ? 1.2f : 0.8f);
+        nvgStroke(args.vg);
+        float cx = W * 0.5f, cy = H * 0.5f, s = std::min(W, H) * 0.22f;
+        nvgBeginPath(args.vg);
+        nvgMoveTo(args.vg, cx, cy - dir * s);
+        nvgLineTo(args.vg, cx + s * 1.2f, cy + dir * s);
+        nvgLineTo(args.vg, cx - s * 1.2f, cy + dir * s);
+        nvgClosePath(args.vg);
+        nvgFillColor(args.vg, on ? nvgRGBA(20, 10, 2, 255) : nvgRGBA(255, 190, 90, 255));
+        nvgFill(args.vg);
+        flash = std::max(0.f, flash - 0.1f);
+    }
+    void onButton(const ButtonEvent& e) override {
+        if (e.button == GLFW_MOUSE_BUTTON_LEFT && e.action == GLFW_PRESS) {
+            if (module) {
+                ParamQuantity* pq = module->paramQuantities[M::LEN_PARAM];
+                pq->setValue((float)clamp((int)pq->getValue() + dir, 1, maxLen));
+            }
+            flash = 1.f;
+            e.consume(this);
+        }
+    }
+};
+
+template <class M>
+struct M1LoopDisplay : OpaqueWidget {
+    M* module = NULL;
+    int maxLen = 8;               // MTX QUAD: 16 (the 8 cells show the half the playhead is in)
+    int len() { return module ? clamp((int)module->params[M::LEN_PARAM].getValue(), 1, maxLen) : 6; }
+    int half() { return (maxLen > 8 && module && module->step >= 8) ? 8 : 0; }
+    void draw(const DrawArgs& args) override {
+        float W = box.size.x, H = box.size.y;
+        nvgBeginPath(args.vg);
+        nvgRoundedRect(args.vg, 0.f, 0.f, W, H, 2.f);
+        nvgFillColor(args.vg, nvgRGBA(14, 9, 3, 255));
+        nvgFill(args.vg);
+        int n = len();
+        int step = module ? module->step : 2;
+        bool run = module ? module->running : true;
+        std::shared_ptr<window::Font> font = APP->window->uiFont;
+        float top = 2.f;
+        if (font) {
+            char b[4]; snprintf(b, sizeof b, "%d", n);
+            nvgFontFaceId(args.vg, font->handle);
+            nvgFontSize(args.vg, 11.f);
+            nvgTextAlign(args.vg, NVG_ALIGN_CENTER | NVG_ALIGN_TOP);
+            nvgFillColor(args.vg, nvgRGBA(255, 190, 90, 255));
+            nvgText(args.vg, W * 0.5f, top, b, NULL);
+            top += 12.f;
+        }
+        // steps 1..8 top to bottom: lit = inside the loop, white = playhead
+        float ch = (H - top - 2.f) / 8.f;
+        int off = half();
+        for (int i = 0; i < 8; i++) {
+            bool in = i + off < n, head = run && step == i + off;
+            nvgBeginPath(args.vg);
+            nvgRoundedRect(args.vg, 3.f, top + i * ch + 0.6f, W - 6.f, ch - 1.2f, 0.8f);
+            nvgFillColor(args.vg, head ? nvgRGBA(255, 255, 255, 235) : in ? nvgRGBA(255, 112, 15, 220) : nvgRGBA(40, 25, 8, 255));
+            nvgFill(args.vg);
+        }
+        nvgBeginPath(args.vg);
+        nvgRoundedRect(args.vg, 0.5f, 0.5f, W - 1.f, H - 1.f, 2.f);
+        nvgStrokeWidth(args.vg, 0.8f);
+        nvgStrokeColor(args.vg, nvgRGBA(255, 180, 90, 80));
+        nvgStroke(args.vg);
+    }
+    // click a step cell to loop up to it
+    void onButton(const ButtonEvent& e) override {
+        if (e.button == GLFW_MOUSE_BUTTON_LEFT && e.action == GLFW_PRESS) {
+            float top = 14.f, ch = (box.size.y - top - 2.f) / 8.f;
+            if (module && e.pos.y >= top) {
+                int i = clamp((int)((e.pos.y - top) / ch), 0, 7);
+                // past 8: a click on the first cell of the other half reaches 9-16 (the cells show one half)
+                module->paramQuantities[M::LEN_PARAM]->setValue((float)(i + 1 + half()));
+            }
+            e.consume(this);
+        }
+    }
+};
+
+
 // Clock display in the MIDI + style: tempo from the CLOCK jack (16th-note clock), or the internal tempo while CLOCK is
 // unpatched (MTX-1: scroll, or click left = +1 / right = -1, to change it), step and run state.
 struct JClockDisplay : OpaqueWidget {
@@ -1161,6 +1259,19 @@ struct SynTHBloKJamWidget : ModuleWidget {
                 addChild(p);
             }
         label(69.6f, 13.8f, "OUT");
+        // LOOP column beside the strips, as MTX-8's (Nick: "add it"): UP / DOWN step the length, the bar shows the loop + playhead
+        label(69.6f, 81.6f, "LOOP");
+        {
+            M1LoopArrow<SynTHBloKJam>* up = createWidget<M1LoopArrow<SynTHBloKJam>>(mm2px(Vec(66.1f, 85.5f)));
+            up->box.size = mm2px(Vec(7.f, 6.6f)); up->module = module; up->dir = 1;
+            addChild(up);
+            M1LoopDisplay<SynTHBloKJam>* ld = createWidget<M1LoopDisplay<SynTHBloKJam>>(mm2px(Vec(66.1f, 93.5f)));
+            ld->box.size = mm2px(Vec(7.f, 22.5f)); ld->module = module;
+            addChild(ld);
+            M1LoopArrow<SynTHBloKJam>* dn = createWidget<M1LoopArrow<SynTHBloKJam>>(mm2px(Vec(66.1f, 117.5f)));
+            dn->box.size = mm2px(Vec(7.f, 6.f)); dn->module = module; dn->dir = -1;
+            addChild(dn);
+        }
         for (int r = 0; r < 8; r++)
             addOutput(createOutputCentered<SmallJack>(mm2px(Vec(69.6f, 22.8f + 7.4f * r)), module, SynTHBloKJam::TRIG_OUTPUT + r));
         for (int i = 0; i < 8; i++) {
