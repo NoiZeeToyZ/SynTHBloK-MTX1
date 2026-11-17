@@ -57,7 +57,7 @@ struct SynTHBloKJam : Module {
                     BANK_PARAM, RANGE_PARAM, BONC_PARAM, BOFFC_PARAM, RUN_PARAM, RESET_PARAM, KNOB_PARAM, BPM_PARAM,
                     SWING_PARAM, DIR_PARAM, CHANCE_PARAM, RAND_PARAM, LINK_PARAM, MIDI_ON_PARAM, ACCENT_PARAM, NUM_PARAMS };   // (BPM on: MTX-1, Nov 16 2026)
     enum InputIds { CLOCK_INPUT, RESET_INPUT, RUN_INPUT, DIR_INPUT, NUM_INPUTS };   // (DIR: MTX-1, Nov 16 2026)
-    enum OutputIds { TRIG_OUTPUT, STRIP_OUTPUT = TRIG_OUTPUT + 8, KNOB_OUTPUT = STRIP_OUTPUT + 8, ACC_OUTPUT, NUM_OUTPUTS };   // (ACC: MTX-1)
+    enum OutputIds { TRIG_OUTPUT, STRIP_OUTPUT = TRIG_OUTPUT + 8, KNOB_OUTPUT = STRIP_OUTPUT + 8, ACC_OUTPUT, CLOCK_OUTPUT, NUM_OUTPUTS };   // (ACC: MTX-1)
     enum LightIds { NUM_LIGHTS };
 
     midi::InputQueue midiIn;
@@ -69,6 +69,7 @@ struct SynTHBloKJam : Module {
     bool pat[8][8][8];
     bool acc[8][8] = {};   // accented steps, per pattern [pattern][step]
     float accHold = 0.f, accLevel = 0.f;
+    dsp::PulseGenerator clkOut;   // CLOCK OUT
     tempolink::Link tlink;   // the shared internal clock (BPM_PARAM, CLOCK unpatched)
     // JAM KNOB LINK: bit i = the i-th of TEMPO / SWING / LENGTH / CHANCE follows the JAM KNOB's moves (relative: a turn of the
     // whole JAM KNOB moves a linked knob across its whole range; each keeps its own place). Float shadows so LENGTH's snapping
@@ -174,8 +175,9 @@ struct SynTHBloKJam : Module {
         // jack gives the ACCENT level for half a step on accented steps (a VCA, a filter, drum velocity)
         configParam(ACCENT_PARAM, 0.f, 1.f, 0.8f, "Accent level (ACC out on accented steps; Ctrl-click a pad to accent its step)", " V", 0.f, 10.f);
         configOutput(ACC_OUTPUT, "Accent (the ACCENT level on accented steps, for half a step)");
+        configOutput(CLOCK_OUTPUT, "Clock out (a 16th pulse from MTX-1's clock while it runs: its own tempo, or CLOCK in)");   // (Nick: "also clock out")
         configSwitch(MIDI_ON_PARAM, 0.f, 1.f, 1.f, "JAM MIDI (off = ignore the JAM, its lights dark)", {"Off", "On"});   // (as the COMPOSER, MTX-8 ...)
-        configSwitch(LINK_PARAM, 0.f, 1.f, 0.f, "Link: on, click TEMPO / SWING / LENGTH / CHANCE to link or unlink them to the JAM KNOB; off when done", {"Done", "Choosing"});
+        configSwitch(LINK_PARAM, 0.f, 1.f, 0.f, "(unused: the LINK screen picks the JAM KNOB's links)", {"Off", "On"});   // (kept: saved patches keep their ids)
         paramQuantities[LEN_PARAM]->snapEnabled = true;
         for (int i = 0; i < CLEAR_PARAM; i++) paramQuantities[i]->snapEnabled = true;
         paramQuantities[BANK_PARAM]->snapEnabled = true;
@@ -391,6 +393,7 @@ struct SynTHBloKJam : Module {
         // DIRECTION: the DIR jack picks it when patched (four 2.5 V zones), else the panel's
         dirNow = inputs[DIR_INPUT].isConnected() ? clamp((int) (inputs[DIR_INPUT].getVoltage() / 2.5f), 0, 3)
                                                  : clamp((int) std::round(params[DIR_PARAM].getValue()), 0, 3);
+        if (clk && running) clkOut.trigger(1e-3f);
         if (clk && running) {
             int len = clamp((int)params[LEN_PARAM].getValue(), 1, 8);
             int dir = dirNow;
@@ -413,6 +416,7 @@ struct SynTHBloKJam : Module {
         }
         if (swingWait > 0.f) { swingWait -= args.sampleTime; if (swingWait <= 0.f) fireStep(swingStep); }
         for (int r = 0; r < 8; r++) outputs[TRIG_OUTPUT + r].setVoltage(pulse[r].process(args.sampleTime) ? 10.f : 0.f);
+        outputs[CLOCK_OUTPUT].setVoltage(clkOut.process(args.sampleTime) ? 10.f : 0.f);
         if (accHold > 0.f) accHold -= args.sampleTime;
         outputs[ACC_OUTPUT].setVoltage(accHold > 0.f ? accLevel : 0.f);
 
@@ -916,65 +920,73 @@ struct M1DirScreen : app::ParamWidget {
     void onHoverScroll(const HoverScrollEvent& e) override { step(e.scrollDelta.y > 0.f ? 1 : -1); e.consume(this); }
 };
 
-// LINK art (MTX-1): amber lines from the JAM KNOB up to each linked knob and the linked knobs' labels lit; while LINK is on,
-// a click on a knob's label row links / unlinks it (small rings show which can be picked)
-struct M1LinkArt : Widget {   // (a plain Widget: clicks it doesn't want go on to the knobs)
-    SynTHBloKJam* module = NULL;
-    float kx[4] = {}, ky = 0.f, ly = 0.f, jx = 0.f, jy = 0.f, jr = 0.f;   // px: small knobs, their label row, the JAM KNOB
-    bool choosing() { return module && module->params[SynTHBloKJam::LINK_PARAM].getValue() > 0.5f; }
-    int mask() { return module ? module->linkMask : 5; }   // (the module browser shows TEMPO + LENGTH linked)
-    void draw(const DrawArgs& args) override {   // the wires, under the knobs and DIR (this widget sits below them)
+// MTX-1: the JAM KNOB's line to its KNOB CV jack (always tied; Nick: "a line to the jack it's tied to all the time"), drawn
+// under the knob, ending in a dot over the jack's label
+struct M1KnobWire : TransparentWidget {
+    float jx = 0.f, jy = 0.f, jr = 0.f, ex = 0.f, ey = 0.f;   // px: the knob's centre / radius, the end over the jack label
+    void draw(const DrawArgs& args) override {
         NVGcontext* vg = args.vg;
-        for (int i = 0; i < 4; i++) {
-            if (mask() >> i & 1) {   // from the JAM KNOB's rim up to under the label, a soft glow then a bright core
-                float x0 = jx + (kx[i] - jx) * 0.25f, y0 = jy - jr, x1 = kx[i], y1 = ly + 6.f;
-                for (int pass = 0; pass < 2; pass++) {
-                    nvgBeginPath(vg);
-                    nvgMoveTo(vg, x0, y0);
-                    nvgBezierTo(vg, x0, y0 - (y0 - y1) * 0.55f, x1, y1 + (y0 - y1) * 0.45f, x1, y1);
-                    nvgStrokeColor(vg, pass ? nvgRGBA(255, 170, 60, 230) : nvgRGBA(255, 122, 0, 70));
-                    nvgStrokeWidth(vg, pass ? 1.1f : 3.5f);
-                    nvgStroke(vg);
-                }
-                nvgBeginPath(vg); nvgCircle(vg, x1, y1, 1.6f); nvgFillColor(vg, nvgRGB(255, 170, 60)); nvgFill(vg);
-            }
+        float x0 = jx + jr, y0 = jy;   // from the knob's right edge across to the jack
+        for (int pass = 0; pass < 2; pass++) {
+            nvgBeginPath(vg);
+            nvgMoveTo(vg, x0, y0);
+            nvgBezierTo(vg, x0 + (ex - x0) * 0.6f, y0 + 2.f, ex, ey - (ey - y0) * 0.6f, ex, ey);
+            nvgStrokeColor(vg, pass ? nvgRGBA(255, 170, 60, 220) : nvgRGBA(255, 122, 0, 60));
+            nvgStrokeWidth(vg, pass ? 1.1f : 3.5f);
+            nvgStroke(vg);
         }
+        nvgBeginPath(vg); nvgCircle(vg, ex, ey, 1.6f); nvgFillColor(vg, nvgRGB(255, 170, 60)); nvgFill(vg);
     }
-    void drawLayer(const DrawArgs& args, int layer) override {   // over everything: pick rings, lit labels
+};
+
+// MTX-1 LINK screen (Nick: "that info on an OLED next to the knob where users select preferences"): TEMPO / SWING / LENGTH /
+// CHANCE, one row each; click a row to link / unlink it to the JAM KNOB (lit = linked: the JAM KNOB moves it)
+struct M1LinkScreen : OpaqueWidget {
+    SynTHBloKJam* module = NULL;
+    static constexpr float TOP = 0.26f;   // of the height: the LINK title above the rows
+    void draw(const DrawArgs& args) override {
+        nvgBeginPath(args.vg);
+        nvgRoundedRect(args.vg, 0.f, 0.f, box.size.x, box.size.y, 1.6f);
+        nvgFillColor(args.vg, nvgRGBA(14, 9, 3, 255));
+        nvgFill(args.vg);
+        nvgStrokeColor(args.vg, nvgRGBA(255, 160, 40, 90));
+        nvgStrokeWidth(args.vg, 0.8f);
+        nvgStroke(args.vg);
+    }
+    void drawLayer(const DrawArgs& args, int layer) override {
         if (layer != 1) return;
+        std::shared_ptr<window::Font> font = APP->window->uiFont;
+        if (!font) return;
         NVGcontext* vg = args.vg;
-        bool ch = choosing();
+        float W = box.size.x, H = box.size.y, rowH = H * (1.f - TOP) / 4.f;
+        int mask = module ? module->linkMask : 5;
+        nvgFontFaceId(vg, font->handle);
+        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgFontSize(vg, 5.5f); nvgTextLetterSpacing(vg, 0.6f);
+        nvgFillColor(vg, nvgRGBA(255, 190, 90, 130));
+        nvgText(vg, W * 0.5f, H * TOP * 0.55f, "LINK", NULL);
         static const char* N[4] = {"TEMPO", "SWING", "LENGTH", "CHANCE"};
         for (int i = 0; i < 4; i++) {
-            bool on = mask() >> i & 1;
-            if (ch) {   // pick rings round the labels while choosing
-                nvgBeginPath(vg);
-                nvgRoundedRect(vg, kx[i] - 13.f, ly - 5.f, 26.f, 10.f, 2.f);
-                nvgStrokeColor(vg, on ? nvgRGB(255, 170, 60) : nvgRGBA(255, 170, 60, 110));
-                nvgStrokeWidth(vg, 0.8f);
-                nvgStroke(vg);
-            }
-            if (on) {   // the label lit
-                std::shared_ptr<window::Font> font = APP->window->uiFont;
-                if (!font) continue;
-                nvgFontFaceId(vg, font->handle);
-                nvgFontSize(vg, 7.f);
-                nvgTextLetterSpacing(vg, 0.8f);
-                nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-                nvgFillColor(vg, nvgRGB(255, 170, 60));
-                nvgText(vg, kx[i], ly, N[i], NULL);
-            }
+            bool on = mask >> i & 1;
+            float y = H * TOP + rowH * (i + 0.5f);
+            nvgBeginPath(vg); nvgCircle(vg, 4.f, y, 1.4f);
+            if (on) { nvgFillColor(vg, nvgRGB(255, 170, 60)); nvgFill(vg); }
+            else { nvgStrokeColor(vg, nvgRGBA(255, 190, 90, 100)); nvgStrokeWidth(vg, 0.6f); nvgStroke(vg); }
+            nvgFontSize(vg, 5.8f); nvgTextLetterSpacing(vg, 0.3f);
+            nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+            nvgFillColor(vg, on ? nvgRGBA(255, 190, 90, 255) : nvgRGBA(255, 190, 90, 110));
+            nvgText(vg, 7.5f, y, N[i], NULL);
         }
     }
     void onButton(const ButtonEvent& e) override {
-        if (module && choosing() && e.action == GLFW_PRESS && e.button == GLFW_MOUSE_BUTTON_LEFT && std::fabs(e.pos.y - ly) < 6.f) {
-            for (int i = 0; i < 4; i++) if (std::fabs(e.pos.x - kx[i]) < 13.f) {
-                module->linkMask ^= 1 << i;
-                e.consume(this);
-                return;
-            }
+        if (module && e.action == GLFW_PRESS && e.button == GLFW_MOUSE_BUTTON_LEFT) {
+            float H = box.size.y, rowH = H * (1.f - TOP) / 4.f;
+            int i = (int) ((e.pos.y - H * TOP) / rowH);
+            if (e.pos.y >= H * TOP && i >= 0 && i < 4) module->linkMask ^= 1 << i;
+            e.consume(this);
+            return;
         }
-        Widget::onButton(e);
+        OpaqueWidget::onButton(e);
     }
 };
 
@@ -1153,13 +1165,6 @@ struct SynTHBloKJamWidget : ModuleWidget {
             addOutput(createOutputCentered<SmallJack>(mm2px(Vec(69.6f, 22.8f + 7.4f * r)), module, SynTHBloKJam::TRIG_OUTPUT + r));
         for (int i = 0; i < 8; i++) {
             addOutput(createOutputCentered<SmallJack>(mm2px(Vec(colX(i) + 3.3f, 81.6f)), module, SynTHBloKJam::STRIP_OUTPUT + i));
-        // ACCENT (MTX-1): the ACC out and its level, in the free column under the trigger outs
-        if (i == 7) {
-            label(69.6f, 85.f, "ACC");
-            addOutput(createOutputCentered<SmallJack>(mm2px(Vec(69.6f, 89.4f)), module, SynTHBloKJam::ACC_OUTPUT));
-            addParam(createParamCentered<RoundSmallBlackKnob>(mm2px(Vec(69.6f, 98.6f)), module, SynTHBloKJam::ACCENT_PARAM));
-            label(69.6f, 104.4f, "ACCENT");
-        }
             JBankSq* q = createWidget<JBankSq>(mm2px(Vec(colX(i), 85.5f)));
             q->box.size = mm2px(Vec(6.6f, 6.6f));
             q->module = module; q->b = i;
@@ -1220,12 +1225,18 @@ struct SynTHBloKJamWidget : ModuleWidget {
                 label(x, 56.f, KN[i]);
             }
             // DIR: the label on the faceplate, the small direction screen, the DIR CV jack
-            M1DirScreen* d = createParam<M1DirScreen>(mm2px(Vec(RC - 7.5f, 59.4f)), module, SynTHBloKJam::DIR_PARAM);
+            M1DirScreen* d = createParam<M1DirScreen>(mm2px(Vec(RC - 7.5f, 61.4f)), module, SynTHBloKJam::DIR_PARAM);
             d->box.size = mm2px(Vec(15.f, 5.2f));
             d->jam = module;
             addParam(d);
-            addInput(createInputCentered<SmallJack>(mm2px(Vec(RC + 13.f, 62.f)), module, SynTHBloKJam::DIR_INPUT));
-            label(RC + 13.f, 66.6f, "DIR");   // the faceplate label, under its jack (clear of the LINK wires)
+            const float JC = RX + RW * 3.5f / 4.f;   // the right-hand jack column (DIR, KNOB CV, CLK OUT line up; Nick: "line jacks up")
+            addInput(createInputCentered<SmallJack>(mm2px(Vec(JC, 64.f)), module, SynTHBloKJam::DIR_INPUT));
+            label(JC, 68.6f, "DIR");
+            // ACCENT (Nick: "organize onto the same panel"): its knob left of the DIR screen, its ACC out in the jack column
+            addParam(createParamCentered<RoundSmallBlackKnob>(mm2px(Vec(RX + RW * 0.5f / 4.f, 63.6f)), module, SynTHBloKJam::ACCENT_PARAM));
+            label(RX + RW * 0.5f / 4.f, 68.6f, "ACCENT");
+            addOutput(createOutputCentered<SmallJack>(mm2px(Vec(JC, 95.f)), module, SynTHBloKJam::ACC_OUTPUT));
+            label(JC, 99.6f, "ACC");   // the faceplate label, under its jack (clear of the LINK wires)
         }
 
         // Knob synced with the JAM's knob (its CV output is in the jack row). (Nov 16 2026, Nick: "space out the knobs for some
@@ -1236,25 +1247,23 @@ struct SynTHBloKJamWidget : ModuleWidget {
         addChild(ring);
         addParam(createParamCentered<RoundLargeBlackKnob>(mm2px(Vec(RC, KY)), module, SynTHBloKJam::KNOB_PARAM));
         label(RC, KY + 12.5f, "JAM KNOB");
-        // LINK: the JAM KNOB's link to TEMPO / SWING / LENGTH / CHANCE (a latch: on = choosing), and the art showing it
+        // LINK screen left of the JAM KNOB, and the knob's line to its KNOB CV jack (under the knob)
         {
-            JAmberBtn* lb = createParam<JAmberBtn>(mm2px(Vec(RC - 6.f, KY + 15.6f)), module, SynTHBloKJam::LINK_PARAM);
-            lb->box.size = mm2px(Vec(12.f, 4.6f));
-            lb->fontSize = 6.f;
-            lb->jam = module; lb->label = "LINK"; lb->latch = true; lb->green = false; lb->jack = -1;
-            addParam(lb);
-            M1LinkArt* la = new M1LinkArt;
-            la->module = module;
-            la->box.pos = mm2px(Vec(RX, 44.f));
-            la->box.size = mm2px(Vec(RW, KY - 44.f));
-            for (int i = 0; i < 4; i++) la->kx[i] = mm2px(RW * (i + 0.5f) / 4.f);
-            la->ky = mm2px(50.f - 44.f); la->ly = mm2px(56.f - 44.f);
-            la->jx = mm2px(RW * 0.5f); la->jy = mm2px(KY - 44.f); la->jr = mm2px(10.5f);
-            if (firstRowKnob) addChildBelow(la, firstRowKnob); else addChild(la);
+            M1LinkScreen* ls = createWidget<M1LinkScreen>(mm2px(Vec(RX + 0.6f, KY - 9.f)));
+            ls->box.size = mm2px(Vec(11.f, 18.f)); ls->module = module;
+            addChild(ls);
+            const float JC = RX + RW * 3.5f / 4.f;   // KNOB CV right of the knob (Nick: "move knob cv next to knob"), in the jack column
+            addOutput(createOutputCentered<SmallJack>(mm2px(Vec(JC, KY)), module, SynTHBloKJam::KNOB_OUTPUT));
+            label(JC, KY + 5.3f, "KNOB CV");
+            M1KnobWire* kw = new M1KnobWire;
+            kw->box.pos = mm2px(Vec(RX, KY - 12.f)); kw->box.size = mm2px(Vec(RW, 24.f));
+            kw->jx = mm2px(RC - RX); kw->jy = mm2px(12.f); kw->jr = mm2px(9.5f);
+            kw->ex = mm2px(JC - RX - 3.4f); kw->ey = mm2px(12.f);
+            if (firstRowKnob) addChildBelow(kw, firstRowKnob); else addChild(kw);
         }
 
         // All right-panel jacks in one row just above the buttons, labels on top.
-        const char* JNAME[4] = {"RUN", "RESET", "CLOCK", "KNOB CV"};
+        const char* JNAME[4] = {"RUN", "RESET", "CLOCK", "CLK OUT"};   // (CLK OUT by CLOCK in; KNOB CV is by its knob now)
         for (int i = 0; i < 4; i++) {
             float x = RX + RW * (i + 0.5f) / 4.f;
             label(x, 105.5f, JNAME[i]);
@@ -1262,7 +1271,7 @@ struct SynTHBloKJamWidget : ModuleWidget {
                 const int JIN[3] = {SynTHBloKJam::RUN_INPUT, SynTHBloKJam::RESET_INPUT, SynTHBloKJam::CLOCK_INPUT};
                 addInput(createInputCentered<SmallJack>(mm2px(Vec(x, 110.5f)), module, JIN[i]));
             } else {
-                addOutput(createOutputCentered<SmallJack>(mm2px(Vec(x, 110.5f)), module, SynTHBloKJam::KNOB_OUTPUT));
+                addOutput(createOutputCentered<SmallJack>(mm2px(Vec(x, 110.5f)), module, SynTHBloKJam::CLOCK_OUTPUT));
             }
         }
     }
